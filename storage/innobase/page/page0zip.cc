@@ -4887,6 +4887,7 @@ corrupt:
 			return(NULL);
 		}
 
+		UNIV_MEM_ASSERT_RW(page_zip->data, page_zip_get_size(page_zip));
 		memcpy(page_zip->data + FIL_PAGE_PREV, ptr, 4);
 		memcpy(page_zip->data + FIL_PAGE_NEXT, ptr + 4, 4);
 		memcpy(page_zip->data + FIL_PAGE_TYPE, ptr + 8, size);

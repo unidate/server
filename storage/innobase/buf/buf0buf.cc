@@ -5629,7 +5629,9 @@ buf_page_create(
 
 	/* Delete possible entries for the page from the insert buffer:
 	such can exist if the page belonged to an index which was dropped */
-	ibuf_merge_or_delete_for_page(NULL, page_id, &page_size, TRUE);
+	if (!recv_no_ibuf_operations) {
+		ibuf_merge_or_delete_for_page(NULL, page_id, &page_size, TRUE);
+	}
 
 	frame = block->frame;
 

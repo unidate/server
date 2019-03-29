@@ -197,6 +197,8 @@ struct recv_addr_t{
 	UT_LIST_BASE_NODE_T(recv_t) rec_list;
 	/** hash node in the hash bucket chain */
 	hash_node_t	addr_hash;
+	/** Contains MLOG_INIT_FILE_PAGE2 or MLOG_ZIP_COMPRESS record */
+	bool		init_records;
 };
 
 /** Report optimized DDL operation (without redo log),
@@ -219,6 +221,82 @@ void (*log_truncate)();
 void (*log_file_op)(ulint space_id, const byte* flags,
 		    const byte* name, ulint len,
 		    const byte* new_name, ulint new_len);
+
+/** Stores the information about MLOG_INIT_FILE_PAGE2 and MLOG_ZIP_PAGE_COMPRESS
+redo logs for each page id during processing of redo logs. */
+class mlog_init_id_t
+{
+private:
+
+	/** Structure contains the start lsn and init/load operation. */
+	struct recv_op_init_t {
+		/* start lsn for the particular page */
+		lsn_t	start_lsn;
+		/* false if it is load operation. */
+		bool	init_record;
+
+		recv_op_init_t(lsn_t lsn, bool init_op)
+			:start_lsn(lsn), init_record(init_op) {}
+
+		lsn_t lsn() { return start_lsn; }
+
+		void update_lsn(lsn_t lsn) { start_lsn = lsn; }
+
+		void init_rec(bool init) { init_record = init; }
+
+		bool get_init() { return init_record; }
+	};
+
+public:
+	typedef std::map<page_id_t, recv_op_init_t,
+			 std::less<page_id_t>,
+			 ut_allocator<std::pair<const page_id_t, recv_op_init_t> > >
+		mlog_init_map;
+
+	static mlog_init_map	mlog_init_ids;
+
+	/** Add the lsn of MLOG_INIT_FILE_PAGE2, MLOG_ZIP_PAGE_COMPRESS and
+	MLOG_INDEX_LOAD for the page id.
+	@param[in]	space		tablespace object
+	@param[in]	page_no		page number
+	@param[in]	start_lsn	lsn of the redo log
+	@param[in]	init		true if it is MLOG_INIT_FILE_PAGE2
+					or MLOG_ZIP_PAGE_COMPRESS. false
+					if it is MLOG_INDEX_LOAD. */
+	static void add(
+		ulint	space,
+		ulint	page_no,
+		lsn_t	start_lsn,
+		bool	init)
+	{
+		const mlog_init_map::value_type
+				v (page_id_t(space, page_no),
+				   recv_op_init_t(start_lsn, true));
+
+		std::pair<mlog_init_map::iterator,bool> p =
+					mlog_init_ids.insert(v);
+
+		if (!p.second && p.first->second.lsn() < start_lsn) {
+			p.first->second.update_lsn(start_lsn);
+			p.first->second.init_rec(init);
+		}
+	}
+
+	/** Get the last stored lsn of the page id and its respective
+	init/load operation.
+	@param[in]	page_id	page id
+	@param[in,out]	init	initialize log or load log
+	@return lsn of the last stored lsn of the page id. */
+	static lsn_t get_last_init_op(page_id_t page_id,bool& init)
+	{
+		mlog_init_map::iterator p = mlog_init_ids.find(page_id);
+		ut_ad(p != mlog_init_ids.end());
+		init = p->second.get_init();
+		return p->second.lsn();
+	}
+};
+
+mlog_init_id_t::mlog_init_map	mlog_init_id_t::mlog_init_ids;
 
 /** Process a MLOG_CREATE2 record that indicates that a tablespace
 is being shrunk in size.
@@ -1802,16 +1880,20 @@ recv_add_to_hash_table(
 		recv_addr->space = space;
 		recv_addr->page_no = page_no;
 		recv_addr->state = RECV_NOT_PROCESSED;
+		recv_addr->init_records = false;
 
 		UT_LIST_INIT(recv_addr->rec_list, &recv_t::rec_list);
 
 		HASH_INSERT(recv_addr_t, addr_hash, recv_sys->addr_hash,
 			    recv_fold(space, page_no), recv_addr);
 		recv_sys->n_addrs++;
-#if 0
-		fprintf(stderr, "Inserting log rec for space %lu, page %lu\n",
-			space, page_no);
-#endif
+	}
+
+	/* Ignore the previous redo log records for this page. */
+	if (type == MLOG_INIT_FILE_PAGE2
+	    || type == MLOG_ZIP_PAGE_COMPRESS) {
+		recv_addr->init_records = true;
+		mlog_init_id_t::add(space, page_no, start_lsn, true);
 	}
 
 	UT_LIST_ADD_LAST(recv_addr->rec_list, recv);
@@ -2009,6 +2091,16 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 			skip_recv = (recv->start_lsn < init_lsn);
 		}
 
+		/* Skip the redo logs if the lsn is less than the
+		last initialize redo log. */
+		if (!skip_recv && recv_addr->init_records) {
+			bool	init_record_exist = false;
+			lsn_t	init_lsn = mlog_init_id_t::get_last_init_op(
+						block->page.id, init_record_exist);
+			skip_recv = (init_record_exist
+				     && recv->start_lsn < init_lsn);
+		}
+
 		/* Ignore applying the redo logs for tablespace that is
 		truncated. Post recovery there is fixup action that will
 		restore the tablespace back to normal state.
@@ -2157,6 +2249,28 @@ static ulint recv_read_in_area(const page_id_t page_id)
 	return(n);
 }
 
+/** Inits a file page for the newly created block.
+@param[in]	block	pointer to a page. */
+static void recv_init_file_page_low(buf_block_t* block)
+{
+	page_t*         page    = buf_block_get_frame(block);
+
+	memset(page, 0, UNIV_PAGE_SIZE);
+
+	mach_write_to_4(page + FIL_PAGE_OFFSET, block->page.id.page_no());
+	mach_write_to_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
+			block->page.id.space());
+
+	if (page_zip_des_t* page_zip= buf_block_get_page_zip(block)) {
+		memset(page_zip->data, 0, page_zip_get_size(page_zip));
+		memcpy(page_zip->data + FIL_PAGE_OFFSET,
+				page + FIL_PAGE_OFFSET, 4);
+		memcpy(page_zip->data + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
+				page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 4);
+	}
+
+}
+
 /** Apply the hash table of stored log records to persistent data pages.
 @param[in]	last_batch	whether the change buffer merge will be
 				performed as part of the operation */
@@ -2236,13 +2350,40 @@ void recv_apply_hashed_log_recs(bool last_batch)
 			const page_size_t&	page_size
 				= fil_space_get_page_size(recv_addr->space,
 							  &found);
+			bool init_record_exist = recv_addr->init_records;
+
+			/* Skip the applying of redo logs if there
+			is no load lsn and last stored lsn of the redo log
+			record is less than latest lsn of the page id. */
+			if (init_record_exist) {
+				lsn_t last_lsn =
+					mlog_init_id_t::get_last_init_op(
+						page_id, init_record_exist);
+				recv_t* last_recv = UT_LIST_GET_LAST(
+						recv_addr->rec_list);
+				if (last_recv->end_lsn < last_lsn) {
+					recv_sys->n_addrs--;
+					continue;
+				}
+			}
 
 			ut_ad(found);
 
 			if (recv_addr->state == RECV_NOT_PROCESSED) {
 				mutex_exit(&recv_sys->mutex);
 
-				if (buf_page_peek(page_id)) {
+				if (init_record_exist) {
+					mtr_t	mtr;
+					mtr.start();
+					buf_block_t* block = buf_page_create(
+						page_id, page_size, &mtr);
+					buf_block_dbg_add_level(
+						block, SYNC_NO_ORDER_CHECK);
+					recv_init_file_page_low(block);
+					recv_recover_page(false, block);
+
+					mtr.commit();
+				} else if (buf_page_peek(page_id)) {
 					mtr_t	mtr;
 					mtr.start();
 
@@ -2506,6 +2647,30 @@ recv_report_corrupt_log(
 	return(true);
 }
 
+/** Mark the MLOG_INDEX_LOAD record for the page id.
+@param[in]	space		tablespace id
+@param[in]	page_no		page number
+@param[in]	start_lsn	start lsn of the redo log
+@param[in]	store		To indicate whether hash table
+				ran out of memory. */
+static void recv_mark_log_index_load(
+	ulint	space,
+	ulint	page_no,
+	lsn_t	start_lsn,
+	store_t	store)
+{
+	recv_addr_t*    recv_addr = recv_get_fil_addr_struct(
+			space, page_no);
+
+	if (store != STORE_YES) {
+		mlog_init_id_t::add(space, page_no, start_lsn, false);
+	}
+
+	if (recv_addr != NULL) {
+		recv_addr->init_records = false;
+	}
+}
+
 /** Parse log records from a buffer and optionally store them to a
 hash table to wait merging to file pages.
 @param[in]	checkpoint_lsn	the LSN of the latest checkpoint
@@ -2663,6 +2828,8 @@ loop:
 			/* fall through */
 		case MLOG_INDEX_LOAD:
 			if (type == MLOG_INDEX_LOAD) {
+				recv_mark_log_index_load(
+					space, page_no, old_lsn, store);
 				if (log_optimized_ddl_op) {
 					log_optimized_ddl_op(space);
 				}
