@@ -6077,7 +6077,7 @@ database_corrupted:
 					<< " encrypted. However key "
 					"management plugin or used "
 					<< "key_version " << key_version
-					<< "is not found or"
+					<< " is not found or"
 					" used encryption algorithm or method does not match."
 					" Can't continue opening the table.";
 			} else {

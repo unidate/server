@@ -1,0 +1,12 @@
+CREATE TABLE t1(c VARCHAR(128)) ENGINE INNODB, encrypted=yes;
+insert into t1 select repeat('a',100);
+INSERT INTO t1 SELECT repeat('b', 100);
+# Kill the server
+# Corrupt the table
+SELECT * FROM t1;
+ERROR 42000: Unknown storage engine 'InnoDB'
+SELECT * FROM t1;
+c
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+DROP TABLE t1;

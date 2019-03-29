@@ -1,0 +1,22 @@
+# Case 1: Recovery with corrupted page and no MLOG_INIT_* redo log records.
+CREATE TABLE t1(f1 INT)ENGINE = InnoDB;
+INSERT INTO t1 VALUES(1);
+INSERT INTO t1 VALUES(2);
+# Kill the server
+# Corrupt the table of t1
+SELECT * FROM t1;
+ERROR 42000: Unknown storage engine 'InnoDB'
+SELECT * FROM t1;
+f1
+1
+2
+DROP TABLE t1;
+# Case 2: Recovery with corrupted page with MLOG_INIT_* redo log
+CREATE TABLE t1(f1 INT)ENGINE=InnoDB;
+INSERT INTO t1 VALUES(1);
+# Kill the server
+# Corrupt the table of t1
+SELECT * FROM t1;
+f1
+1
+DROP TABLE t1;

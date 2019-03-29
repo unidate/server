@@ -2408,7 +2408,16 @@ void recv_apply_hashed_log_recs(bool last_batch)
 	/* Wait until all the pages have been processed */
 
 	while (recv_sys->n_addrs != 0) {
-		bool abort = recv_sys->found_corrupt_log;
+
+		if (recv_sys->found_corrupt_fs)
+		{
+			ib::error() << "Set innodb_force_recovery"
+				" to skip the corrupted page during redo"
+				" log apply.";
+		}
+
+		bool abort = recv_sys->found_corrupt_log
+			     || recv_sys->found_corrupt_fs;
 
 		mutex_exit(&(recv_sys->mutex));
 
