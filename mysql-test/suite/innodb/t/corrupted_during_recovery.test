@@ -5,7 +5,7 @@ call mtr.add_suppression("InnoDB: Plugin initialization aborted");
 call mtr.add_suppression("Plugin 'InnoDB' init function returned error");
 call mtr.add_suppression("Plugin 'InnoDB' registration as a STORAGE ENGINE failed");
 call mtr.add_suppression("InnoDB: Database page corruption on disk or a failed file read of tablespace test/t1 page");
-call mtr.add_suppression("InnoDB: Failed to read file './test/t1.ibd' at offset 3: Page read from tablespace is corrupted.");
+call mtr.add_suppression("InnoDB: Failed to read file .* at offset 3: Page read from tablespace is corrupted.");
 call mtr.add_suppression("InnoDB: Set innodb_force_recovery to skip the corrupted page during redo log apply.");
 --enable_query_log
 
