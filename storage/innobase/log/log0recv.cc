@@ -1736,8 +1736,7 @@ parse_log:
 		break;
 	case MLOG_ZIP_PAGE_COMPRESS:
 		/* Allow anything in page_type when creating a page. */
-		ptr = page_zip_parse_compress(ptr, end_ptr,
-					      page, page_zip);
+		ptr = page_zip_parse_compress(ptr, end_ptr, block);
 		break;
 	case MLOG_ZIP_PAGE_COMPRESS_NO_DATA:
 		if (NULL != (ptr = mlog_parse_index(
@@ -2249,28 +2248,6 @@ static ulint recv_read_in_area(const page_id_t page_id)
 	return(n);
 }
 
-/** Inits a file page for the newly created block.
-@param[in]	block	pointer to a page. */
-static void recv_init_file_page_low(buf_block_t* block)
-{
-	page_t*         page    = buf_block_get_frame(block);
-
-	memset(page, 0, UNIV_PAGE_SIZE);
-
-	mach_write_to_4(page + FIL_PAGE_OFFSET, block->page.id.page_no());
-	mach_write_to_4(page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
-			block->page.id.space());
-
-	if (page_zip_des_t* page_zip= buf_block_get_page_zip(block)) {
-		memset(page_zip->data, 0, page_zip_get_size(page_zip));
-		memcpy(page_zip->data + FIL_PAGE_OFFSET,
-				page + FIL_PAGE_OFFSET, 4);
-		memcpy(page_zip->data + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID,
-				page + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID, 4);
-	}
-
-}
-
 /** Apply the hash table of stored log records to persistent data pages.
 @param[in]	last_batch	whether the change buffer merge will be
 				performed as part of the operation */
@@ -2379,7 +2356,6 @@ void recv_apply_hashed_log_recs(bool last_batch)
 						page_id, page_size, &mtr);
 					buf_block_dbg_add_level(
 						block, SYNC_NO_ORDER_CHECK);
-					recv_init_file_page_low(block);
 					recv_recover_page(false, block);
 
 					mtr.commit();
