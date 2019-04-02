@@ -702,6 +702,7 @@ fil_space_encrypt(
 			ut_print_buf(stderr, src, page_size.physical());
 			fputs("\nInnoDB: After decompressing the page:", stderr);
 			ut_print_buf(stderr, tmp_mem, page_size.physical());
+			ut_ad(0);
 		}
 	}
 #endif /* UNIV_DEBUG */
