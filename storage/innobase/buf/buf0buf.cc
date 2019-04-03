@@ -5646,6 +5646,7 @@ buf_page_create(
 	(3) key_version on encrypted pages (not page 0:0) */
 
 	memset(frame + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION, 0, 8);
+	memset(frame + FIL_PAGE_LSN, 0, 8);
 
 #if defined UNIV_DEBUG || defined UNIV_BUF_DEBUG
 	ut_a(++buf_dbg_counter % 5771 || buf_validate());
