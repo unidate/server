@@ -1,8 +1,9 @@
-CREATE TABLE t1(c VARCHAR(128)) ENGINE INNODB, encrypted=yes;
-insert into t1 select repeat('a',100);
-INSERT INTO t1 SELECT repeat('b', 100);
+CREATE TABLE t1(c VARCHAR(128)) ENGINE=InnoDB, ENCRYPTED=yes;
+INSERT INTO t1 SET c=REPEAT('a',100);
+SET GLOBAL innodb_flush_log_at_trx_commit=1;
+INSERT INTO t1 SET c=REPEAT('b', 100);
 # Kill the server
-# Corrupt the table
+# Corrupt the page checksum
 SELECT * FROM t1;
 ERROR 42000: Unknown storage engine 'InnoDB'
 SELECT * FROM t1;

@@ -6,48 +6,35 @@ call mtr.add_suppression("InnoDB: Plugin initialization aborted");
 call mtr.add_suppression("Plugin 'InnoDB' init function returned error");
 call mtr.add_suppression("Plugin 'InnoDB' registration as a STORAGE ENGINE failed");
 call mtr.add_suppression("InnoDB: Database page corruption on disk or a failed file read of tablespace test/t1 page");
-call mtr.add_suppression("InnoDB: Failed to read file './test/t1.ibd' at offset 3: Table is encrypted but decrypt failed.");
-call mtr.add_suppression("InnoDB: Set innodb_force_recovery to skip the corrupted page during redo log apply.");
-call mtr.add_suppression("InnoDB: The page \\[page id: space=4, page number=3\\] in file .* cannot be decrypted");
-call mtr.add_suppression("InnoDB: Table in tablespace 4 encrypted. However key management plugin or used key_version .* is not found or used encryption algorithm or method does not match. Can't continue opening the table.");
-
+call mtr.add_suppression("InnoDB: Failed to read file '.*test.t1\\.ibd' at offset 3: Table is encrypted but decrypt failed");
+call mtr.add_suppression("InnoDB: The page \\[page id: space=\\d+, page number=3\\] in file '.*test.t1\\.ibd' cannot be decrypted");
+call mtr.add_suppression("InnoDB: Table in tablespace \\d+ encrypted. However key management plugin or used key_version \\d+ is not found or used encryption algorithm or method does not match. Can't continue opening the table.");
 --enable_query_log
- 
-CREATE TABLE t1(c VARCHAR(128)) ENGINE INNODB, encrypted=yes;
-insert into t1 select repeat('a',100);
- 
-let $restart_parameters = --innodb_flush_log_at_trx_commit=1;
---source include/restart_mysqld.inc
 
-INSERT INTO t1 SELECT repeat('b', 100);
- 
-let $MYSQLD_DATADIR=`select @@datadir`;
-let t1_IBD = $MYSQLD_DATADIR/test/t1.ibd;
+let INNODB_PAGE_SIZE=`select @@innodb_page_size`;
+let MYSQLD_DATADIR=`select @@datadir`;
+CREATE TABLE t1(c VARCHAR(128)) ENGINE=InnoDB, ENCRYPTED=yes;
+INSERT INTO t1 SET c=REPEAT('a',100);
+# Force a redo log checkpoint.
+--source include/restart_mysqld.inc
+SET GLOBAL innodb_flush_log_at_trx_commit=1;
+INSERT INTO t1 SET c=REPEAT('b', 100);
 
 --source include/kill_mysqld.inc
- 
---echo # Corrupt the table
- 
+
+--echo # Corrupt the page checksum
+
 perl;
-use strict;
-use warnings;
-use Fcntl qw(:DEFAULT :seek);
- 
-my $ibd_file = $ENV{'t1_IBD'};
- 
-my $chunk;
-my $len;
- 
-sysopen IBD_FILE, $ibd_file, O_RDWR || die "Unable to open $ibd_file";
-sysseek IBD_FILE, 16384 * 3, SEEK_CUR;
-$chunk = '\xAA\xAA\xAA\xAA';
-syswrite IBD_FILE, $chunk, 4;
- 
-close IBD_FILE;
+my $file = "$ENV{MYSQLD_DATADIR}/test/t1.ibd";
+open(FILE, "+<$file") || die "Unable to open $file";
+binmode FILE;
+seek (FILE, $ENV{INNODB_PAGE_SIZE} * 3, SEEK_SET) or die "seek";
+print FILE "junk";
+close FILE or die "close";
 EOF
- 
+
 --source include/start_mysqld.inc
---error ER_UNKNOWN_STORAGE_ENGINE 
+--error ER_UNKNOWN_STORAGE_ENGINE
 SELECT * FROM t1;
 let $restart_parameters=--innodb_force_recovery=1;
 --source include/restart_mysqld.inc
