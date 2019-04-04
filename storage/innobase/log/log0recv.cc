@@ -1997,10 +1997,6 @@ static void recv_recover_page(buf_block_t* block, mtr_t* mtr)
 	page_zip_des_t*	page_zip;
 	recv_t*		recv;
 	byte*		buf;
-	lsn_t		start_lsn;
-	lsn_t		end_lsn;
-	lsn_t		page_lsn;
-	lsn_t		page_newest_lsn;
 	mtr_t		local_mtr;
 	mtr_t*		use_mtr = mtr;
 
@@ -2079,21 +2075,16 @@ skip:
 		buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
 	}
 
-	/* Read the newest modification lsn from the page */
-	page_lsn = mach_read_from_8(page + FIL_PAGE_LSN);
-
 	/* It may be that the page has been modified in the buffer
 	pool: read the newest modification lsn there */
-
-	page_newest_lsn = buf_page_get_newest_modification(&block->page);
-
-	if (page_newest_lsn) {
-
-		page_lsn = page_newest_lsn;
+	lsn_t page_lsn = buf_page_get_newest_modification(&block->page);
+	if (!page_lsn) {
+		/* Read the newest modification lsn from the page */
+		page_lsn = mach_read_from_8(page + FIL_PAGE_LSN);
 	}
 
-	bool modification_to_page = false;
-	start_lsn = end_lsn = 0;
+	bool modification_to_page = false; // not mtr_t::has_modifications()!
+	lsn_t start_lsn = 0, end_lsn = 0;
 
 	recv = UT_LIST_GET_FIRST(recv_addr->rec_list);
 
@@ -2156,7 +2147,7 @@ skip:
 				recv_addr->space, recv_addr->page_no,
 				true, block, use_mtr);
 
-			lsn_t end_lsn = recv->start_lsn + recv->len;
+			end_lsn = recv->start_lsn + recv->len;
 			mach_write_to_8(FIL_PAGE_LSN + page, end_lsn);
 			mach_write_to_8(UNIV_PAGE_SIZE
 					- FIL_PAGE_END_LSN_OLD_CHKSUM
@@ -2185,8 +2176,6 @@ skip:
 #endif /* UNIV_ZIP_DEBUG */
 
 	if (modification_to_page) {
-		ut_a(block);
-
 		log_flush_order_mutex_enter();
 		buf_flush_recv_note_modification(block, start_lsn, end_lsn);
 		log_flush_order_mutex_exit();
