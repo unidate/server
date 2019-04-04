@@ -2347,12 +2347,12 @@ ignore:
 
 			ut_ad(found);
 
-			bool init_record_exist = recv_addr->init_records;
+			bool skip_read = recv_addr->init_records;
 
 			/* Skip the applying of redo logs if there
 			is no load lsn and last stored lsn of the redo log
 			record is less than latest lsn of the page id. */
-			if (init_record_exist) {
+			if (skip_read) {
 				const mlog_reset_t::op& op = mlog_reset.last(
 					page_id);
 
@@ -2361,39 +2361,34 @@ ignore:
 					goto ignore;
 				}
 
-				init_record_exist = !op.load;
+				skip_read = !op.load;
 			}
 
 			if (recv_addr->state == RECV_NOT_PROCESSED) {
 				mutex_exit(&recv_sys->mutex);
+				mtr_t	mtr;
+				mtr.start();
+				buf_block_t* block;
 
-				if (init_record_exist) {
-					mtr_t	mtr;
-					mtr.start();
-					buf_block_t* block = buf_page_create(
+				if (skip_read) {
+					block = buf_page_create(
 						page_id, page_size, &mtr);
+apply:
 					buf_block_dbg_add_level(
 						block, SYNC_NO_ORDER_CHECK);
 					recv_recover_page(false, block);
-
-					mtr.commit();
-				} else if (buf_page_peek(page_id)) {
-					mtr_t	mtr;
-					mtr.start();
-
-					buf_block_t* block = buf_page_get(
-						page_id, page_size,
-						RW_X_LATCH, &mtr);
-
-					buf_block_dbg_add_level(
-						block, SYNC_NO_ORDER_CHECK);
-
-					recv_recover_page(FALSE, block);
-					mtr.commit();
+				} else if ((block = buf_page_get_gen(
+						    page_id, page_size,
+						    RW_X_LATCH, NULL,
+						    BUF_GET_IF_IN_POOL,
+						    __FILE__, __LINE__,
+						    &mtr, NULL)) != NULL) {
+					goto apply;
 				} else {
 					recv_read_in_area(page_id);
 				}
 
+				mtr.commit();
 				mutex_enter(&recv_sys->mutex);
 			}
 		}
@@ -2402,16 +2397,13 @@ ignore:
 	/* Wait until all the pages have been processed */
 
 	while (recv_sys->n_addrs != 0) {
+		const bool abort = recv_sys->found_corrupt_log
+			|| recv_sys->found_corrupt_fs;
 
-		if (recv_sys->found_corrupt_fs)
-		{
-			ib::error() << "Set innodb_force_recovery"
-				" to skip the corrupted page during redo"
-				" log apply.";
+		if (recv_sys->found_corrupt_fs && !srv_force_recovery) {
+			ib::info() << "Set innodb_force_recovery=1"
+				" to ignore corrupted pages.";
 		}
-
-		bool abort = recv_sys->found_corrupt_log
-			     || recv_sys->found_corrupt_fs;
 
 		mutex_exit(&(recv_sys->mutex));
 
