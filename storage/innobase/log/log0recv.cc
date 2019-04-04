@@ -174,6 +174,8 @@ static recv_spaces_t	recv_spaces;
 enum recv_addr_state {
 	/** not yet processed */
 	RECV_NOT_PROCESSED,
+	/** not processed; the page will be reinitialized */
+	RECV_WILL_NOT_READ,
 	/** page is being read */
 	RECV_BEING_READ,
 	/** log records are being applied on the page */
@@ -197,8 +199,6 @@ struct recv_addr_t{
 	UT_LIST_BASE_NODE_T(recv_t) rec_list;
 	/** hash node in the hash bucket chain */
 	hash_node_t	addr_hash;
-	/** Contains MLOG_INIT_FILE_PAGE2 or MLOG_ZIP_COMPRESS record */
-	bool		skip_records;
 };
 
 /** Report optimized DDL operation (without redo log),
@@ -1903,7 +1903,6 @@ recv_add_to_hash_table(
 		recv_addr->space = space;
 		recv_addr->page_no = page_no;
 		recv_addr->state = RECV_NOT_PROCESSED;
-		recv_addr->skip_records = false;
 
 		UT_LIST_INIT(recv_addr->rec_list, &recv_t::rec_list);
 
@@ -1914,7 +1913,9 @@ recv_add_to_hash_table(
 
 	if (type == MLOG_INIT_FILE_PAGE2 || type == MLOG_ZIP_PAGE_COMPRESS) {
 		/* Ignore any earlier redo log records for this page. */
-		recv_addr->skip_records = true;
+		ut_ad(recv_addr->state == RECV_NOT_PROCESSED
+		      || recv_addr->state == RECV_WILL_NOT_READ);
+		recv_addr->state = RECV_WILL_NOT_READ;
 		mlog_reset.add(space, page_no, start_lsn, false);
 	}
 
@@ -2036,12 +2037,10 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		   ("Applying log to page %u:%u",
 		    recv_addr->space, recv_addr->page_no));
 
-	recv_addr->state = RECV_BEING_PROCESSED;
-
 	/* The LSN of the latest page initialization.
 	Any records before this one can be ignored. */
 	lsn_t init_lsn = 0;
-	if (recv_addr->skip_records) {
+	if (recv_addr->state == RECV_WILL_NOT_READ) {
 		const mlog_reset_t::op& op = mlog_reset.last(
 			page_id_t(recv_addr->space, recv_addr->page_no));
 		if (!op.load) {
@@ -2049,6 +2048,7 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		}
 	}
 
+	recv_addr->state = RECV_BEING_PROCESSED;
 	mutex_exit(&(recv_sys->mutex));
 
 	mtr_start(&mtr);
@@ -2116,15 +2116,15 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		with LSN less than recorded LSN is skipped.
 		Note: We can't skip complete recv_addr as same page may have
 		valid REDO records post truncate those needs to be applied. */
-		bool	skip_recv = false;
-		if (srv_was_tablespace_truncated(fil_space_get(recv_addr->space))) {
-			lsn_t	init_lsn =
-				truncate_t::get_truncated_tablespace_init_lsn(
-				recv_addr->space);
-			skip_recv = (recv->start_lsn < init_lsn);
+		bool	skip_recv = recv->start_lsn < init_lsn;
+		if (!skip_recv
+		    && srv_was_tablespace_truncated(
+			    fil_space_get(recv_addr->space))
+		    && recv->start_lsn
+		    < truncate_t::get_truncated_tablespace_init_lsn(
+			    recv_addr->space)) {
+			skip_recv = true;
 		}
-
-		skip_recv = skip_recv || recv->start_lsn < init_lsn;
 
 		/* Ignore applying the redo logs for tablespace that is
 		truncated. Post recovery there is fixup action that will
@@ -2246,7 +2246,7 @@ static void recv_read_in_area(const page_id_t page_id)
 	     page_no < up_limit; page_no++) {
 		recv_addr_t* recv_addr = recv_get_fil_addr_struct(
 			page_id.space(), page_no);
-		if (recv_addr && !recv_addr->skip_records
+		if (recv_addr
 		    && recv_addr->state == RECV_NOT_PROCESSED
 		    && !buf_page_peek(page_id_t(page_id.space(), page_no))) {
 			recv_addr->state = RECV_BEING_READ;
@@ -2341,24 +2341,24 @@ ignore:
 
 			ut_ad(found);
 
-			bool skip_read = recv_addr->skip_records;
+			bool skip_read = false;
 
-			/* Skip the applying of redo logs if there
-			is no load lsn and last stored lsn of the redo log
-			record is less than latest lsn of the page id. */
-			if (skip_read) {
-				const mlog_reset_t::op& op = mlog_reset.last(
-					page_id);
+			switch (recv_addr->state) {
+			case RECV_WILL_NOT_READ:
+				{
+					const mlog_reset_t::op& op
+						= mlog_reset.last(page_id);
 
-				if (UT_LIST_GET_LAST(recv_addr->rec_list)
-				    ->end_lsn < op.lsn) {
-					goto ignore;
+					if (UT_LIST_GET_LAST(
+						    recv_addr->rec_list)
+					    ->end_lsn < op.lsn) {
+						goto ignore;
+					}
+
+					skip_read = !op.load;
 				}
-
-				skip_read = !op.load;
-			}
-
-			if (recv_addr->state == RECV_NOT_PROCESSED) {
+				/* fall through */
+			case RECV_NOT_PROCESSED:
 				mutex_exit(&recv_sys->mutex);
 				mtr_t	mtr;
 				mtr.start();
@@ -2654,7 +2654,9 @@ static void recv_mark_log_index_load(
 
 	if (recv_addr_t* recv_addr = recv_get_fil_addr_struct(
 		    space, page_no)) {
-		recv_addr->skip_records = false;
+		ut_ad(recv_addr->state == RECV_NOT_PROCESSED
+		      || recv_addr->state == RECV_WILL_NOT_READ);
+		recv_addr->state = RECV_NOT_PROCESSED;
 	}
 }
 
