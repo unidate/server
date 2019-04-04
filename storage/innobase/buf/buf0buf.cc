@@ -5631,7 +5631,7 @@ buf_page_create(
 
 	/* Delete possible entries for the page from the insert buffer:
 	such can exist if the page belonged to an index which was dropped */
-	if (!recv_no_ibuf_operations) {
+	if (!recv_recovery_is_on()) {
 		ibuf_merge_or_delete_for_page(NULL, page_id, &page_size, TRUE);
 	}
 

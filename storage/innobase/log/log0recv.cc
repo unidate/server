@@ -1992,7 +1992,6 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 {
 	page_t*		page;
 	page_zip_des_t*	page_zip;
-	recv_addr_t*	recv_addr;
 	recv_t*		recv;
 	byte*		buf;
 	lsn_t		start_lsn;
@@ -2002,31 +2001,36 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 	ibool		modification_to_page;
 	mtr_t		mtr;
 
-	mutex_enter(&(recv_sys->mutex));
+	if (just_read_in) {
+		mutex_enter(&recv_sys->mutex);
+	}
 
-	if (recv_sys->apply_log_recs == FALSE) {
+	ut_ad(mutex_own(&recv_sys->mutex));
 
+	if (!recv_sys->apply_log_recs) {
 		/* Log records should not be applied now */
-
-		mutex_exit(&(recv_sys->mutex));
-
+skip:
+		if (just_read_in) {
+			mutex_exit(&recv_sys->mutex);
+		}
 		return;
 	}
 
-	recv_addr = recv_get_fil_addr_struct(block->page.id.space(),
-					     block->page.id.page_no());
-
-	if ((recv_addr == NULL)
-	    || (recv_addr->state == RECV_BEING_PROCESSED)
-	    || (recv_addr->state == RECV_PROCESSED)) {
-		ut_ad(recv_addr == NULL || recv_needed_recovery);
-
-		mutex_exit(&(recv_sys->mutex));
-
-		return;
+	recv_addr_t* recv_addr = recv_get_fil_addr_struct(
+		block->page.id.space(), block->page.id.page_no());
+	if (!recv_addr) {
+		goto skip;
 	}
 
 	ut_ad(recv_needed_recovery);
+
+	switch (recv_addr->state) {
+	case RECV_BEING_PROCESSED:
+	case RECV_PROCESSED:
+		goto skip;
+	default:
+		break;
+	}
 
 	if (UNIV_UNLIKELY(srv_print_verbose_log == 2)) {
 		fprintf(stderr, "Applying log to page %u:%u\n",
@@ -2227,7 +2231,9 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		}
 	}
 
-	mutex_exit(&recv_sys->mutex);
+	if (just_read_in) {
+		mutex_exit(&recv_sys->mutex);
+	}
 }
 
 /** Reads in pages which have hashed log records, from an area around a given
@@ -2239,8 +2245,6 @@ static void recv_read_in_area(const page_id_t page_id)
 	ulint	page_no = page_id.page_no()
 		- (page_id.page_no() % RECV_READ_AHEAD_AREA);
 	ulint*	p = page_nos;
-
-	mutex_enter(&recv_sys->mutex);
 
 	for (const ulint up_limit = page_no + RECV_READ_AHEAD_AREA;
 	     page_no < up_limit; page_no++) {
@@ -2255,9 +2259,9 @@ static void recv_read_in_area(const page_id_t page_id)
 	}
 
 	mutex_exit(&recv_sys->mutex);
-
 	buf_read_recv_pages(FALSE, page_id.space(), page_nos,
 			    ulint(p - page_nos));
+	mutex_enter(&recv_sys->mutex);
 }
 
 /** Apply the hash table of stored log records to persistent data pages.
@@ -2310,25 +2314,37 @@ void recv_apply_hashed_log_recs(bool last_batch)
 		}
 	}
 
+	mtr_t mtr;
+
 	for (ulint i = 0; i < hash_get_n_cells(recv_sys->addr_hash); i++) {
 		for (recv_addr_t* recv_addr = static_cast<recv_addr_t*>(
 			     HASH_GET_FIRST(recv_sys->addr_hash, i));
 		     recv_addr;
 		     recv_addr = static_cast<recv_addr_t*>(
 				HASH_GET_NEXT(addr_hash, recv_addr))) {
-
-			if (srv_is_tablespace_truncated(recv_addr->space)) {
-				/* Avoid applying REDO log for the tablespace
-				that is schedule for TRUNCATE. */
-				recv_addr->state = RECV_DISCARDED;
+			if (!UT_LIST_GET_LEN(recv_addr->rec_list)) {
 ignore:
 				ut_a(recv_sys->n_addrs);
 				recv_sys->n_addrs--;
 				continue;
 			}
 
-			if (recv_addr->state == RECV_DISCARDED
-			    || !UT_LIST_GET_LEN(recv_addr->rec_list)) {
+			switch (recv_addr->state) {
+			case RECV_BEING_READ:
+			case RECV_BEING_PROCESSED:
+			case RECV_PROCESSED:
+				continue;
+			case RECV_DISCARDED:
+				goto ignore;
+			case RECV_NOT_PROCESSED:
+			case RECV_WILL_NOT_READ:
+				break;
+			}
+
+			if (srv_is_tablespace_truncated(recv_addr->space)) {
+				/* Avoid applying REDO log for the tablespace
+				that is schedule for TRUNCATE. */
+				recv_addr->state = RECV_DISCARDED;
 				goto ignore;
 			}
 
@@ -2341,49 +2357,50 @@ ignore:
 
 			ut_ad(found);
 
-			bool skip_read = false;
-
-			switch (recv_addr->state) {
-			case RECV_WILL_NOT_READ:
-				{
-					const mlog_reset_t::op& op
-						= mlog_reset.last(page_id);
-
-					if (UT_LIST_GET_LAST(
-						    recv_addr->rec_list)
-					    ->end_lsn < op.lsn) {
-						goto ignore;
-					}
-
-					skip_read = !op.load;
-				}
-				/* fall through */
-			case RECV_NOT_PROCESSED:
-				mutex_exit(&recv_sys->mutex);
-				mtr_t	mtr;
-				mtr.start();
-				buf_block_t* block;
-
-				if (skip_read) {
-					block = buf_page_create(
-						page_id, page_size, &mtr);
+			if (recv_addr->state == RECV_NOT_PROCESSED) {
 apply:
+				mtr.start();
+				buf_block_t* block = buf_page_get_gen(
+					page_id, page_size, RW_X_LATCH, NULL,
+					BUF_GET_IF_IN_POOL, __FILE__, __LINE__,
+					&mtr, NULL);
+				if (block) {
 					buf_block_dbg_add_level(
 						block, SYNC_NO_ORDER_CHECK);
 					recv_recover_page(false, block);
-				} else if ((block = buf_page_get_gen(
-						    page_id, page_size,
-						    RW_X_LATCH, NULL,
-						    BUF_GET_IF_IN_POOL,
-						    __FILE__, __LINE__,
-						    &mtr, NULL)) != NULL) {
-					goto apply;
-				} else {
+				}
+				mtr.commit();
+				if (!block) {
 					recv_read_in_area(page_id);
 				}
+			} else {
+				const mlog_reset_t::op& op
+					= mlog_reset.last(page_id);
 
+				if (UT_LIST_GET_LAST(recv_addr->rec_list)
+				    ->end_lsn < op.lsn) {
+					goto ignore;
+				}
+
+				if (op.load) {
+					goto apply;
+				}
+
+				mtr.start();
+				buf_block_t* block = buf_page_create(
+					page_id, page_size, &mtr);
+				buf_block_dbg_add_level(block,
+							SYNC_NO_ORDER_CHECK);
+				recv_recover_page(false, block);
 				mtr.commit();
-				mutex_enter(&recv_sys->mutex);
+
+				if (!recv_no_ibuf_operations) {
+					mutex_exit(&recv_sys->mutex);
+					ibuf_merge_or_delete_for_page(
+						NULL, page_id, &page_size,
+						true);
+					mutex_enter(&recv_sys->mutex);
+				}
 			}
 		}
 	}
