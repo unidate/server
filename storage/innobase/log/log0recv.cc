@@ -222,64 +222,54 @@ void (*log_file_op)(ulint space_id, const byte* flags,
 		    const byte* name, ulint len,
 		    const byte* new_name, ulint new_len);
 
-/** Stores the information about MLOG_INIT_FILE_PAGE2 and MLOG_ZIP_PAGE_COMPRESS
-redo logs for each page id during processing of redo logs. */
-class mlog_init_id_t
+/** Information about resetting page contents during redo log processing */
+class mlog_reset_t
 {
-private:
-
+public:
 	/** Structure contains the start lsn and init/load operation. */
-	struct recv_op_init_t {
-		/* start lsn for the particular page */
-		lsn_t	start_lsn;
-		/* false if it is load operation. */
-		bool	init_record;
-
-		recv_op_init_t(lsn_t lsn, bool init_op)
-			:start_lsn(lsn), init_record(init_op) {}
-
-		lsn_t lsn() { return start_lsn; }
-
-		void update_lsn(lsn_t lsn) { start_lsn = lsn; }
-
-		void init_rec(bool init) { init_record = init; }
-
-		bool get_init() { return init_record; }
+	struct op {
+		/** log sequence number of the special record */
+		lsn_t lsn;
+		/** true = MLOG_INDEX_LOAD;
+		false = MLOG_INIT_FILE_PAGE2 or MLOG_ZIP_PAGE_COMPRESS */
+		bool load;
 	};
 
-public:
-	typedef std::map<page_id_t, recv_op_init_t,
-			 std::less<page_id_t>,
-			 ut_allocator<std::pair<const page_id_t, recv_op_init_t> > >
-		mlog_init_map;
+private:
+	typedef std::map<const page_id_t, op,
+			 std::less<const page_id_t>,
+			 ut_allocator<std::pair<const page_id_t, op> > >
+		map;
+	/** Map of page reset operations.
+	FIXME: Merge this to recv_sys->addr_hash! */
+	map ids;
 
-	static mlog_init_map	mlog_init_ids;
-
-	/** Add the lsn of MLOG_INIT_FILE_PAGE2, MLOG_ZIP_PAGE_COMPRESS and
-	MLOG_INDEX_LOAD for the page id.
-	@param[in]	space		tablespace object
+	/** Record a special redo log operation for a page.
+	@param[in]	space		tablespace identifier
 	@param[in]	page_no		page number
-	@param[in]	start_lsn	lsn of the redo log
-	@param[in]	init		true if it is MLOG_INIT_FILE_PAGE2
-					or MLOG_ZIP_PAGE_COMPRESS. false
-					if it is MLOG_INDEX_LOAD. */
-	static void add(
-		ulint	space,
-		ulint	page_no,
-		lsn_t	start_lsn,
-		bool	init)
+	@param[in]	op		the special operation */
+	void add(ulint space, ulint page_no, const op& op)
 	{
-		const mlog_init_map::value_type
-				v (page_id_t(space, page_no),
-				   recv_op_init_t(start_lsn, true));
+		const map::value_type v(page_id_t(space, page_no), op);
 
-		std::pair<mlog_init_map::iterator,bool> p =
-					mlog_init_ids.insert(v);
+		std::pair<map::iterator, bool> p = ids.insert(v);
 
-		if (!p.second && p.first->second.lsn() < start_lsn) {
-			p.first->second.update_lsn(start_lsn);
-			p.first->second.init_rec(init);
+		if (!p.second && p.first->second.lsn < op.lsn) {
+			p.first->second = op;
 		}
+	}
+
+public:
+	/** Record MLOG_INIT_FILE_PAGE2, MLOG_ZIP_PAGE_COMPRESS or
+	MLOG_INDEX_LOAD for a page.
+	@param[in]	space		tablespace identifier
+	@param[in]	page_no		page number
+	@param[in]	lsn		log sequence number
+	@param[in]	load		whether it is MLOG_INDEX_LOAD */
+	void add(ulint space, ulint page_no, lsn_t lsn, bool load)
+	{
+		const op op { lsn, load };
+		add(space, page_no, op);
 	}
 
 	/** Get the last stored lsn of the page id and its respective
@@ -287,16 +277,13 @@ public:
 	@param[in]	page_id	page id
 	@param[in,out]	init	initialize log or load log
 	@return lsn of the last stored lsn of the page id. */
-	static lsn_t get_last_init_op(page_id_t page_id,bool& init)
+	const op& last(page_id_t page_id) const
 	{
-		mlog_init_map::iterator p = mlog_init_ids.find(page_id);
-		ut_ad(p != mlog_init_ids.end());
-		init = p->second.get_init();
-		return p->second.lsn();
+		return ids.find(page_id)->second;
 	}
 };
 
-mlog_init_id_t::mlog_init_map	mlog_init_id_t::mlog_init_ids;
+static mlog_reset_t mlog_reset;
 
 /** Process a MLOG_CREATE2 record that indicates that a tablespace
 is being shrunk in size.
@@ -1924,7 +1911,7 @@ recv_add_to_hash_table(
 	if (type == MLOG_INIT_FILE_PAGE2
 	    || type == MLOG_ZIP_PAGE_COMPRESS) {
 		recv_addr->init_records = true;
-		mlog_init_id_t::add(space, page_no, start_lsn, true);
+		mlog_reset.add(space, page_no, start_lsn, false);
 	}
 
 	UT_LIST_ADD_LAST(recv_addr->rec_list, recv);
@@ -2125,11 +2112,10 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		/* Skip the redo logs if the lsn is less than the
 		last initialize redo log. */
 		if (!skip_recv && recv_addr->init_records) {
-			bool	init_record_exist = false;
-			lsn_t	init_lsn = mlog_init_id_t::get_last_init_op(
-						block->page.id, init_record_exist);
-			skip_recv = (init_record_exist
-				     && recv->start_lsn < init_lsn);
+			const mlog_reset_t::op& op = mlog_reset.last(
+				page_id_t(recv_addr->space,
+					  recv_addr->page_no));
+			skip_recv = !op.load && recv->start_lsn < op.lsn;
 		}
 
 		/* Ignore applying the redo logs for tablespace that is
@@ -2340,17 +2326,16 @@ void recv_apply_hashed_log_recs(bool last_batch)
 			if (srv_is_tablespace_truncated(recv_addr->space)) {
 				/* Avoid applying REDO log for the tablespace
 				that is schedule for TRUNCATE. */
-				ut_a(recv_sys->n_addrs);
 				recv_addr->state = RECV_DISCARDED;
+ignore:
+				ut_a(recv_sys->n_addrs);
 				recv_sys->n_addrs--;
 				continue;
 			}
 
 			if (recv_addr->state == RECV_DISCARDED
 			    || !UT_LIST_GET_LEN(recv_addr->rec_list)) {
-				ut_a(recv_sys->n_addrs);
-				recv_sys->n_addrs--;
-				continue;
+				goto ignore;
 			}
 
 			const page_id_t		page_id(recv_addr->space,
@@ -2359,24 +2344,25 @@ void recv_apply_hashed_log_recs(bool last_batch)
 			const page_size_t&	page_size
 				= fil_space_get_page_size(recv_addr->space,
 							  &found);
+
+			ut_ad(found);
+
 			bool init_record_exist = recv_addr->init_records;
 
 			/* Skip the applying of redo logs if there
 			is no load lsn and last stored lsn of the redo log
 			record is less than latest lsn of the page id. */
 			if (init_record_exist) {
-				lsn_t last_lsn =
-					mlog_init_id_t::get_last_init_op(
-						page_id, init_record_exist);
-				recv_t* last_recv = UT_LIST_GET_LAST(
-						recv_addr->rec_list);
-				if (last_recv->end_lsn < last_lsn) {
-					recv_sys->n_addrs--;
-					continue;
-				}
-			}
+				const mlog_reset_t::op& op = mlog_reset.last(
+					page_id);
 
-			ut_ad(found);
+				if (UT_LIST_GET_LAST(recv_addr->rec_list)
+				    ->end_lsn < op.lsn) {
+					goto ignore;
+				}
+
+				init_record_exist = !op.load;
+			}
 
 			if (recv_addr->state == RECV_NOT_PROCESSED) {
 				mutex_exit(&recv_sys->mutex);
@@ -2676,14 +2662,12 @@ static void recv_mark_log_index_load(
 	lsn_t	start_lsn,
 	store_t	store)
 {
-	recv_addr_t*    recv_addr = recv_get_fil_addr_struct(
-			space, page_no);
-
 	if (store != STORE_YES) {
-		mlog_init_id_t::add(space, page_no, start_lsn, false);
+		mlog_reset.add(space, page_no, start_lsn, true);
 	}
 
-	if (recv_addr != NULL) {
+	if (recv_addr_t* recv_addr = recv_get_fil_addr_struct(
+		    space, page_no)) {
 		recv_addr->init_records = false;
 	}
 }
