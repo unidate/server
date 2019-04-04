@@ -198,7 +198,7 @@ struct recv_addr_t{
 	/** hash node in the hash bucket chain */
 	hash_node_t	addr_hash;
 	/** Contains MLOG_INIT_FILE_PAGE2 or MLOG_ZIP_COMPRESS record */
-	bool		init_records;
+	bool		skip_records;
 };
 
 /** Report optimized DDL operation (without redo log),
@@ -250,6 +250,7 @@ private:
 	@param[in]	op		the special operation */
 	void add(ulint space, ulint page_no, const op& op)
 	{
+		ut_ad(mutex_own(&recv_sys->mutex));
 		const map::value_type v(page_id_t(space, page_no), op);
 
 		std::pair<map::iterator, bool> p = ids.insert(v);
@@ -276,9 +277,11 @@ public:
 	init/load operation.
 	@param[in]	page_id	page id
 	@param[in,out]	init	initialize log or load log
-	@return lsn of the last stored lsn of the page id. */
+	@return the latest special operation for the page;
+	not valid after releasing recv_sys->mutex. */
 	const op& last(page_id_t page_id) const
 	{
+		ut_ad(mutex_own(&recv_sys->mutex));
 		return ids.find(page_id)->second;
 	}
 };
@@ -1831,6 +1834,8 @@ recv_get_fil_addr_struct(
 	ulint	space,	/*!< in: space id */
 	ulint	page_no)/*!< in: page number */
 {
+	ut_ad(mutex_own(&recv_sys->mutex));
+
 	recv_addr_t*	recv_addr;
 
 	for (recv_addr = static_cast<recv_addr_t*>(
@@ -1898,7 +1903,7 @@ recv_add_to_hash_table(
 		recv_addr->space = space;
 		recv_addr->page_no = page_no;
 		recv_addr->state = RECV_NOT_PROCESSED;
-		recv_addr->init_records = false;
+		recv_addr->skip_records = false;
 
 		UT_LIST_INIT(recv_addr->rec_list, &recv_t::rec_list);
 
@@ -1907,10 +1912,9 @@ recv_add_to_hash_table(
 		recv_sys->n_addrs++;
 	}
 
-	/* Ignore the previous redo log records for this page. */
-	if (type == MLOG_INIT_FILE_PAGE2
-	    || type == MLOG_ZIP_PAGE_COMPRESS) {
-		recv_addr->init_records = true;
+	if (type == MLOG_INIT_FILE_PAGE2 || type == MLOG_ZIP_PAGE_COMPRESS) {
+		/* Ignore any earlier redo log records for this page. */
+		recv_addr->skip_records = true;
 		mlog_reset.add(space, page_no, start_lsn, false);
 	}
 
@@ -2034,6 +2038,17 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 
 	recv_addr->state = RECV_BEING_PROCESSED;
 
+	/* The LSN of the latest page initialization.
+	Any records before this one can be ignored. */
+	lsn_t init_lsn = 0;
+	if (recv_addr->skip_records) {
+		const mlog_reset_t::op& op = mlog_reset.last(
+			page_id_t(recv_addr->space, recv_addr->page_no));
+		if (!op.load) {
+			init_lsn = op.lsn;
+		}
+	}
+
 	mutex_exit(&(recv_sys->mutex));
 
 	mtr_start(&mtr);
@@ -2109,14 +2124,7 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 			skip_recv = (recv->start_lsn < init_lsn);
 		}
 
-		/* Skip the redo logs if the lsn is less than the
-		last initialize redo log. */
-		if (!skip_recv && recv_addr->init_records) {
-			const mlog_reset_t::op& op = mlog_reset.last(
-				page_id_t(recv_addr->space,
-					  recv_addr->page_no));
-			skip_recv = !op.load && recv->start_lsn < op.lsn;
-		}
+		skip_recv = skip_recv || recv->start_lsn < init_lsn;
 
 		/* Ignore applying the redo logs for tablespace that is
 		truncated. Post recovery there is fixup action that will
@@ -2125,9 +2133,9 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 		redo will have action recorded on page before tablespace
 		was re-inited and that would lead to an error while applying
 		such action. */
-		if (recv->start_lsn >= page_lsn
-		    && !srv_is_tablespace_truncated(recv_addr->space)
-		    && !skip_recv) {
+		if (!skip_recv
+		    && recv->start_lsn >= page_lsn
+		    && !srv_is_tablespace_truncated(recv_addr->space)) {
 
 			lsn_t	end_lsn;
 
@@ -2224,46 +2232,32 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 
 /** Reads in pages which have hashed log records, from an area around a given
 page number.
-@param[in]	page_id	page id
-@return number of pages found */
-static ulint recv_read_in_area(const page_id_t page_id)
+@param[in]	page_id	page id */
+static void recv_read_in_area(const page_id_t page_id)
 {
-	recv_addr_t* recv_addr;
 	ulint	page_nos[RECV_READ_AHEAD_AREA];
-	ulint	low_limit;
-	ulint	n;
-
-	low_limit = page_id.page_no()
+	ulint	page_no = page_id.page_no()
 		- (page_id.page_no() % RECV_READ_AHEAD_AREA);
+	ulint*	p = page_nos;
 
-	n = 0;
+	mutex_enter(&recv_sys->mutex);
 
-	for (ulint page_no = low_limit;
-	     page_no < low_limit + RECV_READ_AHEAD_AREA;
-	     page_no++) {
-
-		recv_addr = recv_get_fil_addr_struct(page_id.space(), page_no);
-
-		const page_id_t	cur_page_id(page_id.space(), page_no);
-
-		if (recv_addr && !buf_page_peek(cur_page_id)) {
-
-			mutex_enter(&(recv_sys->mutex));
-
-			if (recv_addr->state == RECV_NOT_PROCESSED) {
-				recv_addr->state = RECV_BEING_READ;
-
-				page_nos[n] = page_no;
-
-				n++;
-			}
-
-			mutex_exit(&(recv_sys->mutex));
+	for (const ulint up_limit = page_no + RECV_READ_AHEAD_AREA;
+	     page_no < up_limit; page_no++) {
+		recv_addr_t* recv_addr = recv_get_fil_addr_struct(
+			page_id.space(), page_no);
+		if (recv_addr && !recv_addr->skip_records
+		    && recv_addr->state == RECV_NOT_PROCESSED
+		    && !buf_page_peek(page_id_t(page_id.space(), page_no))) {
+			recv_addr->state = RECV_BEING_READ;
+			*p++ = page_no;
 		}
 	}
 
-	buf_read_recv_pages(FALSE, page_id.space(), page_nos, n);
-	return(n);
+	mutex_exit(&recv_sys->mutex);
+
+	buf_read_recv_pages(FALSE, page_id.space(), page_nos,
+			    ulint(p - page_nos));
 }
 
 /** Apply the hash table of stored log records to persistent data pages.
@@ -2347,7 +2341,7 @@ ignore:
 
 			ut_ad(found);
 
-			bool skip_read = recv_addr->init_records;
+			bool skip_read = recv_addr->skip_records;
 
 			/* Skip the applying of redo logs if there
 			is no load lsn and last stored lsn of the redo log
@@ -2660,7 +2654,7 @@ static void recv_mark_log_index_load(
 
 	if (recv_addr_t* recv_addr = recv_get_fil_addr_struct(
 		    space, page_no)) {
-		recv_addr->init_records = false;
+		recv_addr->skip_records = false;
 	}
 }
 
@@ -2685,6 +2679,7 @@ bool recv_parse_log_recs(lsn_t checkpoint_lsn, store_t store, bool apply)
 	byte*		body;
 
 	ut_ad(log_mutex_own());
+	ut_ad(mutex_own(&recv_sys->mutex));
 	ut_ad(recv_sys->parse_start_lsn != 0);
 loop:
 	ptr = recv_sys->buf + recv_sys->recovered_offset;
@@ -3260,6 +3255,8 @@ recv_scan_log_recs(
 
 	*group_scanned_lsn = scanned_lsn;
 
+	mutex_enter(&recv_sys->mutex);
+
 	if (more_data && !recv_sys->found_corrupt_log) {
 		/* Try to parse more log records */
 
@@ -3269,7 +3266,8 @@ recv_scan_log_recs(
 			      || recv_sys->found_corrupt_fs
 			      || recv_sys->mlog_checkpoint_lsn
 			      == recv_sys->recovered_lsn);
-			return(true);
+			finished = true;
+			goto func_exit;
 		}
 
 		if (*store_to_hash != STORE_NO
@@ -3290,6 +3288,8 @@ recv_scan_log_recs(
 		}
 	}
 
+func_exit:
+	mutex_exit(&recv_sys->mutex);
 	return(finished);
 }
 
