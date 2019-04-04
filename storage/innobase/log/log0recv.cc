@@ -284,6 +284,9 @@ public:
 		ut_ad(mutex_own(&recv_sys->mutex));
 		return ids.find(page_id)->second;
 	}
+
+	/** Clear the data structure */
+	void clear() { ids.clear(); }
 };
 
 static mlog_reset_t mlog_reset;
@@ -689,6 +692,7 @@ recv_sys_close()
 	}
 
 	recv_spaces.clear();
+	mlog_reset.clear();
 }
 
 /************************************************************
