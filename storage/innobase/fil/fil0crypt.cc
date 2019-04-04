@@ -697,13 +697,7 @@ fil_space_encrypt(
 
 		memcpy(tmp_mem + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION,
 		       src + FIL_PAGE_FILE_FLUSH_LSN_OR_KEY_VERSION, 8);
-		if (memcmp(src, tmp_mem, page_size.physical())) {
-			fputs("\nInnoDB: old page from disk:", stderr);
-			ut_print_buf(stderr, src, page_size.physical());
-			fputs("\nInnoDB: After decompressing the page:", stderr);
-			ut_print_buf(stderr, tmp_mem, page_size.physical());
-			ut_ad(0);
-		}
+		ut_ad(!memcmp(src, tmp_mem, page_size.physical()));
 	}
 #endif /* UNIV_DEBUG */
 
