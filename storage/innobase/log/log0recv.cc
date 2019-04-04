@@ -1989,10 +1989,9 @@ recv_data_copy_to_buf(
 
 /** Apply the hashed log records to the page, if the page lsn is less than the
 lsn of a log record.
-@param just_read_in	whether the page recently arrived to the I/O handler
-@param block		the page in the buffer pool */
-void
-recv_recover_page(bool just_read_in, buf_block_t* block)
+@param[in,out]	block	buffer pool page
+@param[in,out]	mtr	mini-transaction; NULL if the page was just read in */
+static void recv_recover_page(buf_block_t* block, mtr_t* mtr)
 {
 	page_t*		page;
 	page_zip_des_t*	page_zip;
@@ -2002,10 +2001,13 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 	lsn_t		end_lsn;
 	lsn_t		page_lsn;
 	lsn_t		page_newest_lsn;
-	ibool		modification_to_page;
-	mtr_t		mtr;
+	mtr_t		local_mtr;
+	mtr_t*		use_mtr = mtr;
 
-	if (just_read_in) {
+	if (!mtr) {
+		local_mtr.start();
+		local_mtr.set_log_mode(MTR_LOG_NONE);
+		use_mtr = &local_mtr;
 		mutex_enter(&recv_sys->mutex);
 	}
 
@@ -2014,7 +2016,7 @@ recv_recover_page(bool just_read_in, buf_block_t* block)
 	if (!recv_sys->apply_log_recs) {
 		/* Log records should not be applied now */
 skip:
-		if (just_read_in) {
+		if (!mtr) {
 			mutex_exit(&recv_sys->mutex);
 		}
 		return;
@@ -2057,29 +2059,25 @@ skip:
 	}
 
 	recv_addr->state = RECV_BEING_PROCESSED;
-	mutex_exit(&(recv_sys->mutex));
-
-	mtr_start(&mtr);
-	mtr_set_log_mode(&mtr, MTR_LOG_NONE);
+	mutex_exit(&recv_sys->mutex);
 
 	page = block->frame;
 	page_zip = buf_block_get_page_zip(block);
 
-	if (just_read_in) {
+	if (!mtr) {
 		/* Move the ownership of the x-latch on the page to
 		this OS thread, so that we can acquire a second
 		x-latch on it.  This is needed for the operations to
 		the page to pass the debug checks. */
 
 		rw_lock_x_lock_move_ownership(&block->lock);
+
+		ibool	success = buf_page_get_known_nowait(
+			RW_X_LATCH, block, BUF_KEEP_OLD,
+			__FILE__, __LINE__, &local_mtr);
+		ut_a(success);
+		buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
 	}
-
-	ibool	success = buf_page_get_known_nowait(
-		RW_X_LATCH, block, BUF_KEEP_OLD,
-		__FILE__, __LINE__, &mtr);
-	ut_a(success);
-
-	buf_block_dbg_add_level(block, SYNC_NO_ORDER_CHECK);
 
 	/* Read the newest modification lsn from the page */
 	page_lsn = mach_read_from_8(page + FIL_PAGE_LSN);
@@ -2094,7 +2092,7 @@ skip:
 		page_lsn = page_newest_lsn;
 	}
 
-	modification_to_page = FALSE;
+	bool modification_to_page = false;
 	start_lsn = end_lsn = 0;
 
 	recv = UT_LIST_GET_FIRST(recv_addr->rec_list);
@@ -2115,43 +2113,28 @@ skip:
 			buf = ((byte*)(recv->data)) + sizeof(recv_data_t);
 		}
 
-		/* If per-table tablespace was truncated and there exist REDO
-		records before truncate that are to be applied as part of
-		recovery (checkpoint didn't happen since truncate was done)
-		skip such records using lsn check as they may not stand valid
-		post truncate.
-		LSN at start of truncate is recorded and any redo record
-		with LSN less than recorded LSN is skipped.
-		Note: We can't skip complete recv_addr as same page may have
-		valid REDO records post truncate those needs to be applied. */
-		bool	skip_recv = recv->start_lsn < init_lsn;
-		if (!skip_recv
-		    && srv_was_tablespace_truncated(
-			    fil_space_get(recv_addr->space))
-		    && recv->start_lsn
-		    < truncate_t::get_truncated_tablespace_init_lsn(
-			    recv_addr->space)) {
-			skip_recv = true;
-		}
-
-		/* Ignore applying the redo logs for tablespace that is
-		truncated. Post recovery there is fixup action that will
-		restore the tablespace back to normal state.
-		Applying redo at this stage can result in error given that
-		redo will have action recorded on page before tablespace
-		was re-inited and that would lead to an error while applying
-		such action. */
-		if (!skip_recv
-		    && recv->start_lsn >= page_lsn
-		    && !srv_is_tablespace_truncated(recv_addr->space)) {
-
-			lsn_t	end_lsn;
-
+		if (recv->start_lsn < init_lsn || recv->start_lsn < page_lsn) {
+			/* Ignore this record, because there are later changes
+			for this page. */
+		} else if (srv_was_tablespace_truncated(
+				   fil_space_get(recv_addr->space))
+			   && recv->start_lsn
+			   < truncate_t::get_truncated_tablespace_init_lsn(
+				   recv_addr->space)) {
+			/* If per-table tablespace was truncated and
+			there exist REDO records before truncate that
+			are to be applied as part of recovery
+			(checkpoint didn't happen since truncate was
+			done) skip such records using lsn check as
+			they may not stand valid post truncate. */
+		} else if (srv_is_tablespace_truncated(recv_addr->space)) {
+			/* The table will be truncated after applying
+			normal redo log records. */
+		} else {
 			if (!modification_to_page) {
-
-				modification_to_page = TRUE;
 				start_lsn = recv->start_lsn;
 			}
+			modification_to_page = true;
 
 			if (UNIV_UNLIKELY(srv_print_verbose_log == 2)) {
 				fprintf(stderr, "apply " LSN_PF ":"
@@ -2171,9 +2154,9 @@ skip:
 			recv_parse_or_apply_log_rec_body(
 				recv->type, buf, buf + recv->len,
 				recv_addr->space, recv_addr->page_no,
-				true, block, &mtr);
+				true, block, use_mtr);
 
-			end_lsn = recv->start_lsn + recv->len;
+			lsn_t end_lsn = recv->start_lsn + recv->len;
 			mach_write_to_8(FIL_PAGE_LSN + page, end_lsn);
 			mach_write_to_8(UNIV_PAGE_SIZE
 					- FIL_PAGE_END_LSN_OLD_CHKSUM
@@ -2212,9 +2195,8 @@ skip:
 	/* Make sure that committing mtr does not change the modification
 	lsn values of page */
 
-	mtr.discard_modifications();
-
-	mtr_commit(&mtr);
+	use_mtr->discard_modifications();
+	use_mtr->commit();
 
 	ib_time_t time = ut_time();
 
@@ -2235,9 +2217,17 @@ skip:
 		}
 	}
 
-	if (just_read_in) {
+	if (!mtr) {
 		mutex_exit(&recv_sys->mutex);
 	}
+}
+
+/** Apply any buffered redo log to a page that was just read from a data file.
+@param[in,out]	bpage	buffer pool page */
+void recv_recover_page(buf_page_t* bpage)
+{
+	ut_ad(buf_page_get_state(bpage) == BUF_BLOCK_FILE_PAGE);
+	recv_recover_page(reinterpret_cast<buf_block_t*>(bpage), NULL);
 }
 
 /** Reads in pages which have hashed log records, from an area around a given
@@ -2364,6 +2354,7 @@ ignore:
 			if (recv_addr->state == RECV_NOT_PROCESSED) {
 apply:
 				mtr.start();
+				mtr.set_log_mode(MTR_LOG_NONE);
 				buf_block_t* block = buf_page_get_gen(
 					page_id, page_size, RW_X_LATCH, NULL,
 					BUF_GET_IF_IN_POOL, __FILE__, __LINE__,
@@ -2371,10 +2362,10 @@ apply:
 				if (block) {
 					buf_block_dbg_add_level(
 						block, SYNC_NO_ORDER_CHECK);
-					recv_recover_page(false, block);
-				}
-				mtr.commit();
-				if (!block) {
+					recv_recover_page(block, &mtr);
+					ut_ad(mtr.has_committed());
+				} else {
+					mtr.commit();
 					recv_read_in_area(page_id);
 				}
 			} else {
@@ -2390,14 +2381,6 @@ apply:
 					goto apply;
 				}
 
-				mtr.start();
-				buf_block_t* block = buf_page_create(
-					page_id, page_size, &mtr);
-				buf_block_dbg_add_level(block,
-							SYNC_NO_ORDER_CHECK);
-				recv_recover_page(false, block);
-				mtr.commit();
-
 				if (!recv_no_ibuf_operations) {
 					mutex_exit(&recv_sys->mutex);
 					ibuf_merge_or_delete_for_page(
@@ -2405,6 +2388,16 @@ apply:
 						true);
 					mutex_enter(&recv_sys->mutex);
 				}
+
+				mtr.start();
+				mtr.set_log_mode(MTR_LOG_NONE);
+				buf_block_t* block = buf_page_create(
+					page_id, page_size, &mtr);
+				buf_block_dbg_add_level(block,
+							SYNC_NO_ORDER_CHECK);
+				mtr.x_latch_at_savepoint(0, block);
+				recv_recover_page(block, &mtr);
+				ut_ad(mtr.has_committed());
 			}
 		}
 	}

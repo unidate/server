@@ -6057,10 +6057,8 @@ database_corrupted:
 		DBUG_EXECUTE_IF("buf_page_import_corrupt_failure",
 				page_not_corrupt: bpage = bpage; );
 
-		if (recv_recovery_is_on()) {
-			/* Pages must be uncompressed for crash recovery. */
-			ut_a(uncompressed);
-			recv_recover_page(TRUE, (buf_block_t*) bpage);
+		if (UNIV_UNLIKELY(recv_recovery_is_on())) {
+			recv_recover_page(bpage);
 		}
 
 		/* If space is being truncated then avoid ibuf operation.
